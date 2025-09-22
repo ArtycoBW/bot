@@ -1,0 +1,6 @@
+aiogram==3.*
+appwrite==7.*
+python-dotenv
+pydantic==2.*
+gspread
+google-auth
