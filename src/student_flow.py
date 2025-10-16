@@ -1,4 +1,3 @@
-# src/student_flow.py
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
@@ -8,8 +7,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 from .appwrite_client import get_repo
-# хелпер, который достаёт список tg_user_id админов (см. admin_flow._get_admin_chat_ids)
-from .admin_flow import _get_admin_chat_ids
 
 import os
 from datetime import datetime
@@ -45,9 +42,11 @@ class StudentForm(StatesGroup):
     tech_stack = State()
     confirm = State()
 
-    # единичное редактирование/сохраняем id редактируемой заявки
+    # точечное редактирование
     editing = State()
-    editing_existing = State()
+
+    # текстовый ответ на вопрос от преподавателя
+    answering_admin = State()
 
 # порядок полей для шага «Назад»
 ORDER = [
@@ -78,6 +77,79 @@ FIELDS = [
 FIELD_LABEL = {k: label for k, label, _ in FIELDS}
 FIELD_HINT  = {k: hint  for k, _, hint in FIELDS}
 
+# ====================== ЛОКАЛЬНЫЕ ХЕЛПЕРЫ ДЛЯ АДМИНОВ (без импортов из admin_flow) ======================
+def _get_admin_chat_ids() -> list[int]:
+    """
+    Возвращает список tg_user_id админов из коллекции админов Appwrite.
+    Без импортов из admin_flow — чтобы не было циклических импортов.
+    """
+    repo = get_repo()
+    try:
+        docs = repo.db.list_documents(
+            database_id=repo.db_id,
+            collection_id=repo.admins_col,
+        ).get("documents", [])
+        ids: list[int] = []
+        for d in docs:
+            try:
+                ids.append(int(str(d.get("tg_user_id", "")).strip()))
+            except Exception:
+                pass
+        return ids
+    except Exception:
+        return []
+
+async def notify_admins(bot, text: str):
+    try:
+        admin_ids = _get_admin_chat_ids()
+        for aid in admin_ids:
+            try:
+                await bot.send_message(aid, text, parse_mode="HTML")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# --- Клавиатуры ---
+def student_menu_with_answer_kb(allow_answer: bool, has_question: bool):
+    kb = InlineKeyboardBuilder()
+    # кнопка текстового ответа — если есть вопрос
+    if has_question:
+        kb.button(text="📝 Ответить преподавателю", callback_data="student:menu:answer")
+        kb.adjust(1)
+    # кнопки принять/отклонить — только если админ включил allow_student_reply
+    if allow_answer:
+        kb.button(text="✅ Подтвердить заявку", callback_data="student:answer:yes")
+        kb.button(text="❌ Отменить заявку", callback_data="student:answer:no")
+        kb.adjust(2)
+    kb.button(text="⬅️ Назад к действиям", callback_data="student:menu:back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def student_actions_kb(doc: dict | None):
+    """
+    Меню «Доступные действия».
+    «Изменить» скрываем, если студент уже дал булев ответ (student_answer != None).
+    """
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📄 Моя заявка", callback_data="student:menu:view")
+
+    can_edit = True
+    if doc and doc.get("student_answer") is not None:
+        can_edit = False
+
+    if can_edit:
+        kb.button(text="✏️ Изменить", callback_data="student:menu:edit")
+    kb.button(text="❌ Отменить", callback_data="student:menu:cancel")
+
+    if can_edit:
+        kb.adjust(2, 1)
+    else:
+        kb.adjust(1, 1)
+
+    return kb.as_markup()
+
 def start_reply_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="/start")]],
@@ -92,8 +164,6 @@ def ru_status(s: str) -> str:
         "rejected": "Отклонена",
     }.get((s or "").lower(), s or "—")
 
-
-# ====================== КНОПКИ ======================
 def back_kb(prev_key: str | None):
     kb = InlineKeyboardBuilder()
     if prev_key:
@@ -160,7 +230,6 @@ def edit_fields_menu_kb(page: int = 1, per_page: int = 6):
     kb.adjust(1)
     return kb.as_markup()
 
-
 # ====================== GOOGLE SHEETS ======================
 def _get_sheet():
     if gspread is None or Credentials is None:
@@ -215,19 +284,34 @@ def append_submission_to_sheet(appw_doc: dict):
     except Exception as e:
         logging.exception("Не удалось записать заявку в Google Sheets: %s", e)
 
-
 # ====================== ХЕЛПЕРЫ ======================
-async def notify_admins(bot, text: str):
-    """Оповестить всех админов (на базе admin_flow._get_admin_chat_ids)."""
-    try:
-        admin_ids = _get_admin_chat_ids()
-        for aid in admin_ids:
-            try:
-                await bot.send_message(aid, text, parse_mode="HTML")
-            except Exception:
-                pass
-    except Exception:
-        pass
+def _format_submission_for_admin(title: str, payload: dict, appwrite_id: str | None = None, status: str | None = None) -> str:
+    status_ru = ru_status(status) if status else "—"
+    lines = [
+        f"<b>{title}</b>",
+    ]
+    lines += [
+        f"👤 ФИО: {payload.get('full_name','—')}",
+        f"👥 Группа: {payload.get('group','—')}",
+        f"📧 Email: {payload.get('email','—')}",
+        f"📅 Дата рождения: {payload.get('birthDate','—')}",
+        "",
+        f"📚 Книги: {payload.get('books','—')}",
+        f"🎬 Фильм/сериал: {payload.get('likedRecentMovie','—')}",
+        f"ℹ️ О студенте: {payload.get('aboutYou','—')}",
+        f"🎓 После университета: {payload.get('afterUniversity','—')}",
+        f"🎖 Красный диплом: {payload.get('redDiploma','—')}",
+        f"📑 Научная деятельность: {payload.get('scienceInterest','—')}",
+        "",
+        f"📝 Тема: {payload.get('thesisTopic','—')}",
+        f"📄 Описание: {payload.get('thesisDescription','—')}",
+        f"📊 Аналоги: {payload.get('analogsProsCons','—')}",
+        f"⚙️ Функционал: {payload.get('plannedFeatures','—')}",
+        f"🖥️ Стек: {payload.get('techStack','—')}",
+    ]
+    if status:
+        lines += ["", f"📌 Статус: {status_ru}"]
+    return "\n".join(lines)
 
 async def show_greeting_and_outline(msg: Message):
     await msg.answer(
@@ -249,7 +333,7 @@ async def show_greeting_and_outline(msg: Message):
     )
 
 def validate_email(value: str) -> bool:
-    return "@" in value and "." in value
+    return "@" in value and "@" != value[0] and "." in value
 
 def prev_key_of(key: str) -> str | None:
     try:
@@ -259,9 +343,7 @@ def prev_key_of(key: str) -> str | None:
         return None
 
 async def ask_for_field(target_key: str, msg_or_cb, state: FSMContext):
-    """Показать пользователю вопрос для поля (с кнопкой Назад)."""
     prev = prev_key_of(target_key)
-    # установить нужный state
     mapping = {
         "full_name": StudentForm.full_name,
         "group": StudentForm.group,
@@ -275,13 +357,14 @@ async def ask_for_field(target_key: str, msg_or_cb, state: FSMContext):
         "scienceInterest": StudentForm.science_interest,
         "thesisTopic": StudentForm.thesis_topic,
         "thesisDescription": StudentForm.thesis_description,
-        "analogsProsCons": StudentForm.analogs_pros_cons,
+        "analogsProsCons": StudentForm.analogs_proсs if False else StudentForm.analogs_proсs if False else StudentForm.analogs_pros_cons,
         "plannedFeatures": StudentForm.planned_features,
         "techStack": StudentForm.tech_stack,
     }
+    mapping["analogsProsCons"] = StudentForm.analogs_pros_cons
+
     await state.set_state(mapping[target_key])
 
-    # текст вопроса
     prompts = {
         "full_name":          "👤 Введите *ФИО*:",
         "group":              "👥 Укажите вашу *группу* (например, ВИС-41):",
@@ -301,26 +384,17 @@ async def ask_for_field(target_key: str, msg_or_cb, state: FSMContext):
     }
     text = prompts[target_key]
 
-    # отправка
     if target_key == "redDiploma":
         markup = red_diploma_kb(prev)
-        if isinstance(msg_or_cb, Message):
-            await msg_or_cb.answer(text, parse_mode="Markdown", reply_markup=markup)
-        else:
-            await msg_or_cb.message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
     elif target_key == "scienceInterest":
         markup = science_interest_kb(prev)
-        if isinstance(msg_or_cb, Message):
-            await msg_or_cb.answer(text, parse_mode="Markdown", reply_markup=markup)
-        else:
-            await msg_or_cb.message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
     else:
         markup = back_kb(prev)
-        if isinstance(msg_or_cb, Message):
-            await msg_or_cb.answer(text, parse_mode="Markdown", reply_markup=markup)
-        else:
-            await msg_or_cb.message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
 
+    if isinstance(msg_or_cb, Message):
+        await msg_or_cb.answer(text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await msg_or_cb.message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
 
 async def show_summary(msg_or_cb, data: dict, editing: bool = False):
     text = (
@@ -347,7 +421,6 @@ async def show_summary(msg_or_cb, data: dict, editing: bool = False):
     else:
         await msg_or_cb.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
 
-
 # ====================== СЦЕНАРИЙ ======================
 @router.message(CommandStart())
 async def start(msg: Message, state: FSMContext):
@@ -361,6 +434,7 @@ async def start(msg: Message, state: FSMContext):
             f"Если нужно переотправить — напишите /start позже, когда статус будет `rejected`.",
             parse_mode="Markdown",
         )
+        await msg.answer("Доступные действия:", reply_markup=student_actions_kb(existing))
         return
     await show_greeting_and_outline(msg)
 
@@ -587,63 +661,60 @@ async def confirm_handler(cb: CallbackQuery, state: FSMContext):
 
         editing_doc_id = data.get("_editing_doc_id")
         if editing_doc_id:
-            # обновление существующей
             repo.db.update_document(
                 database_id=repo.db_id,
                 collection_id=repo.sub_col,
                 document_id=editing_doc_id,
                 data=payload,
             )
-            # уведомим администраторов
-            await notify_admins(
-                cb.bot,
-                "✏️ <b>Заявка обновлена</b>\n"
-                f"ФИО: {payload.get('full_name','—')}\n"
-                f"Группа: {payload.get('group','—')}\n"
-                f"Email: {payload.get('email','—')}\n\n"
-                "Открыть панель: /admin"
+
+            admin_text = _format_submission_for_admin(
+                title="✏️ Заявка обновлена",
+                payload=payload,
+                appwrite_id=editing_doc_id,
+                status=None,
             )
+            await notify_admins(cb.bot, admin_text)
+
             await state.clear()
+            doc = repo.get_submission_by_user(str(cb.from_user.id))
             await cb.message.edit_text(
                 "💾 <b>Изменения сохранены!</b>\n\nДоступные действия:",
-                reply_markup=student_menu_kb(),
+                reply_markup=student_actions_kb(doc),
                 parse_mode="HTML",
             )
             await cb.answer("Сохранено")
             return
 
-        # новая заявка
         payload["status"] = "pending"
         created = repo.create_submission(payload)
 
-        # в Sheets
         payload_with_ids = dict(payload)
         payload_with_ids["$id"] = created.get("$id")
         append_submission_to_sheet(payload_with_ids)
 
-        # уведомим администраторов
-        await notify_admins(
-            cb.bot,
-            "🆕 <b>Новая заявка</b>\n"
-            f"ФИО: {payload.get('full_name','—')}\n"
-            f"Группа: {payload.get('group','—')}\n"
-            f"Email: {payload.get('email','—')}\n\n"
-            "Открыть панель: /admin"
+        admin_text = _format_submission_for_admin(
+            title="🆕 Новая заявка",
+            payload=payload,
+            appwrite_id=created.get("$id"),
+            status=payload.get("status"),
         )
+        await notify_admins(cb.bot, admin_text)
 
         await state.clear()
+        doc = repo.get_submission_by_user(str(cb.from_user.id))
         await cb.message.edit_text(
             "✅ <b>Анкета отправлена!</b>\n\n"
             f"Статус: ⏳ {ru_status('pending')}\n"
             "О решении придёт уведомление.\n\n"
             "Доступные действия:",
-            reply_markup=student_menu_kb(),
+            reply_markup=student_actions_kb(doc),
             parse_mode="HTML",
         )
         await cb.answer("Отправлено")
         return
 
-# ====================== МЕНЮ СТУДЕНТА ======================
+# ====================== МОЯ ЗАЯВКА / МЕНЮ ДЕЙСТВИЙ ======================
 @router.callback_query(F.data == "student:menu:view")
 async def view_submission(cb: CallbackQuery):
     repo = get_repo()
@@ -652,9 +723,21 @@ async def view_submission(cb: CallbackQuery):
         await cb.answer("У вас нет заявки.", show_alert=True)
         return
 
-    status_ru = ru_status(doc.get("status"))
+    status_ru_ = ru_status(doc.get("status"))
     admin_comment = doc.get("admin_comment")
     admin_comment = admin_comment if (isinstance(admin_comment, str) and admin_comment.strip()) else "нет"
+    allow_answer = bool(doc.get("allow_student_reply", False))
+    admin_question = doc.get("admin_question") or "—"
+
+    ans_bool = doc.get("student_answer", None)
+    if ans_bool is True:
+        ans_bool_text = "принял ✅"
+    elif ans_bool is False:
+        ans_bool_text = "отклонил ❌"
+    else:
+        ans_bool_text = "—"
+
+    text_answer = doc.get("student_text_answer") or "—"
 
     text = (
         "📄 <b>Ваша заявка</b>\n\n"
@@ -673,20 +756,37 @@ async def view_submission(cb: CallbackQuery):
         f"📊 Аналоги: {doc.get('analogsProsCons','—')}\n"
         f"⚙️ Функционал: {doc.get('plannedFeatures','—')}\n"
         f"🖥️ Стек: {doc.get('techStack','—')}\n\n"
-        f"📌 Статус: {status_ru}\n"
-        f"💬 Комментарий администратора: {admin_comment}"
+        f"📌 Статус: {status_ru_}\n"
+        f"💬 Комментарий преподавателя: {admin_comment}\n\n"
+        f"❓ Вопрос от преподавателя: {admin_question}\n"
+        f"📝 Ваш текстовый ответ: {text_answer}\n"
+        f"✅ Ваш выбор (если требуется): {ans_bool_text}"
     )
 
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=student_menu_kb())
+    has_question = bool(doc.get("admin_question"))
+    await cb.message.edit_text(text, parse_mode="HTML",
+                               reply_markup=student_menu_with_answer_kb(allow_answer, has_question))
+    await cb.answer()
+
+@router.callback_query(F.data == "student:menu:back")
+async def student_menu_back(cb: CallbackQuery):
+    repo = get_repo()
+    doc = repo.get_submission_by_user(str(cb.from_user.id))
+    await cb.message.edit_text("Доступные действия:", reply_markup=student_actions_kb(doc))
     await cb.answer()
 
 @router.callback_query(F.data == "student:menu:edit")
 async def edit_submission(cb: CallbackQuery, state: FSMContext):
-    """Загружаем текущую заявку и переходим сразу на экран подтверждения для точечного редактирования."""
+    """Загружаем текущую заявку и переходим на экран подтверждения для точечного редактирования."""
     repo = get_repo()
     doc = repo.get_submission_by_user(str(cb.from_user.id))
     if not doc:
         await cb.answer("У вас нет заявки.", show_alert=True)
+        return
+
+    # запретим редактирование, если студент уже дал булев ответ
+    if doc.get("student_answer") is not None:
+        await cb.answer("Редактирование недоступно после вашего ответа.", show_alert=True)
         return
 
     preload = {
@@ -726,3 +826,124 @@ async def cancel_submission(cb: CallbackQuery):
     repo.db.delete_document(repo.db_id, repo.sub_col, doc["$id"])
     await cb.message.edit_text("❌ Ваша заявка удалена.\n\nВы можете заполнить её заново через /start.")
     await cb.answer("Удалено")
+
+# ====================== ОТВЕТ СТУДЕНТА ======================
+# 1) ТЕКСТОВЫЙ ответ на вопрос преподавателя
+@router.callback_query(F.data == "student:menu:answer")
+async def student_answer_begin(cb: CallbackQuery, state: FSMContext):
+    repo = get_repo()
+    doc = repo.get_submission_by_user(str(cb.from_user.id))
+    if not doc:
+        await cb.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    # ❗️Разрешаем текстовый ответ, если есть вопрос — независимо от allow_student_reply
+    if not bool(doc.get("admin_question")):
+        await cb.answer("Сейчас текстовый ответ не требуется.", show_alert=True)
+        return
+
+    await state.set_state(StudentForm.answering_admin)
+    await cb.message.answer("Напишите ваш ответ преподавателю одним сообщением:")
+    await cb.answer()
+
+
+@router.message(StudentForm.answering_admin)
+async def student_answer_text_save(msg: Message, state: FSMContext):
+    repo = get_repo()
+    doc = repo.get_submission_by_user(str(msg.from_user.id))
+    if not doc:
+        await msg.answer("Заявка не найдена.")
+        await state.clear()
+        return
+
+    answer = msg.text.strip()
+    try:
+        repo.db.update_document(
+            database_id=repo.db_id,
+            collection_id=repo.sub_col,
+            document_id=doc["$id"],
+            data={
+                "student_text_answer": answer,
+                # закрываем «режим ответов» после отправки текста
+                "allow_student_reply": False,
+            },
+        )
+    except Exception:
+        await msg.answer("Не удалось сохранить ответ. Попробуйте позже.")
+        await state.clear()
+        return
+
+    await notify_admins(
+        msg.bot,
+        "📨 <b>Текстовый ответ студента по заявке</b>\n"
+        f"👤 {doc.get('full_name','—')} | {doc.get('group','—')}\n"
+        f"📝 Ответ: {answer}\n\n"
+        f"Открыть панель: /admin"
+    )
+
+    await msg.answer("Спасибо! Ваш ответ отправлен преподавателю ✅")
+    await state.clear()
+
+
+# 2) Булев ответ (Принять / Отклонить), включается только через admin:toggle_reply:on
+@router.callback_query(F.data == "student:answer:yes")
+async def student_answer_yes(cb: CallbackQuery):
+    repo = get_repo()
+    doc = repo.get_submission_by_user(str(cb.from_user.id))
+    if not doc:
+        await cb.answer("Заявка не найдена.", show_alert=True)
+        return
+    try:
+        repo.db.update_document(
+            database_id=repo.db_id,
+            collection_id=repo.sub_col,
+            document_id=doc["$id"],
+            data={
+                "student_answer": True,
+                "allow_student_reply": False,
+            },
+        )
+    except Exception:
+        await cb.answer("Не удалось сохранить ответ.", show_alert=True)
+        return
+
+    await notify_admins(
+        cb.bot,
+        "📨 <b>Ответ студента по заявке</b>\n"
+        f"👤 {doc.get('full_name','—')} | {doc.get('group','—')}\n"
+        f"📝 Выбор: принял ✅\n\n"
+        f"Открыть панель: /admin"
+    )
+    await cb.answer("Ответ сохранён")
+    await view_submission(cb)
+
+@router.callback_query(F.data == "student:answer:no")
+async def student_answer_no(cb: CallbackQuery):
+    repo = get_repo()
+    doc = repo.get_submission_by_user(str(cb.from_user.id))
+    if not doc:
+        await cb.answer("Заявка не найдена.", show_alert=True)
+        return
+    try:
+        repo.db.update_document(
+            database_id=repo.db_id,
+            collection_id=repo.sub_col,
+            document_id=doc["$id"],
+            data={
+                "student_answer": False,
+                "allow_student_reply": False,
+            },
+        )
+    except Exception:
+        await cb.answer("Не удалось сохранить ответ.", show_alert=True)
+        return
+
+    await notify_admins(
+        cb.bot,
+        "📨 <b>Ответ студента по заявке</b>\n"
+        f"👤 {doc.get('full_name','—')} | {doc.get('group','—')}\n"
+        f"📝 Выбор: отклонил ❌\n\n"
+        f"Открыть панель: /admin"
+    )
+    await cb.answer("Ответ сохранён")
+    await view_submission(cb)

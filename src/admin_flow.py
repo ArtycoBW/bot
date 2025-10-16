@@ -9,6 +9,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .appwrite_client import get_repo
 
@@ -21,15 +22,18 @@ except Exception:
 
 router = Router()
 
-# -----------------------------------------------------------------------------
-
-
+# ----------------------------------------------------------------------------- #
+# FSM
+# ----------------------------------------------------------------------------- #
 class AdminState(StatesGroup):
-    waiting_comment = State()      # для approve/reject
-    waiting_group = State()
-    waiting_note = State()         # для «просто комментария»
+    waiting_comment = State()   # для approve/reject
+    waiting_group = State()     # поиск по группе
+    waiting_note = State()      # «просто комментарий»
+    waiting_question = State()  # задать вопрос студенту (для ответа)
 
-
+# ----------------------------------------------------------------------------- #
+# Helpers
+# ----------------------------------------------------------------------------- #
 def _status_title(s: str) -> str:
     return {
         "pending": "⏳ В ожидании",
@@ -37,6 +41,21 @@ def _status_title(s: str) -> str:
         "rejected": "❌ Отклонённые",
     }.get(s, s)
 
+def _student_open_kb(allow_answer: bool = False):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📄 Открыть мою заявку", callback_data="student:menu:view")
+    if allow_answer:
+        kb.button(text="📝 Ответить преподавателю", callback_data="student:menu:answer")
+    kb.adjust(1, 1)
+    return kb.as_markup()
+
+def _student_decision_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Принять", callback_data="student:answer:yes")
+    kb.button(text="❌ Отклонить", callback_data="student:answer:no")
+    kb.button(text="📄 Моя заявка", callback_data="student:menu:view")
+    kb.adjust(2, 1)
+    return kb.as_markup()
 
 def _safe_count(status: str) -> str:
     try:
@@ -46,11 +65,8 @@ def _safe_count(status: str) -> str:
     except Exception:
         return "?"
 
-
 def _get_admin_chat_ids() -> List[int]:
-    """
-    Возвращает список tg_user_id всех админов.
-    """
+    """Возвращает список tg_user_id всех админов (из коллекции админов)."""
     repo = get_repo()
     try:
         docs = repo.db.list_documents(
@@ -67,14 +83,15 @@ def _get_admin_chat_ids() -> List[int]:
     except Exception:
         return []
 
-
-# -------------------------- Google Sheets helpers ----------------------------
+# -------------------------- Google Sheets helpers ---------------------------- #
 def _get_sheet():
     if gspread is None or Credentials is None:
         raise RuntimeError("gspread/google-auth не установлены в окружении")
+
     sheet_id = os.getenv("GOOGLE_SHEET_ID")
     tab_name = os.getenv("GOOGLE_SHEET_TAB", "Лист1")
     sa_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_PATH", "./service_account.json")
+
     if not sheet_id:
         raise RuntimeError("GOOGLE_SHEET_ID не задан")
     if not os.path.exists(sa_path):
@@ -93,16 +110,13 @@ def _get_sheet():
         ws = sh.add_worksheet(title=tab_name, rows="2000", cols="40")
     return ws
 
-
 def _header_indexes(ws) -> dict[str, int]:
     headers = ws.row_values(1)
     return {(h or "").strip().lower(): i + 1 for i, h in enumerate(headers)}
 
-
 def update_sheet_status_and_comment(appwrite_id: str, new_status: Optional[str], comment: Optional[str]):
-    """
-    Обновляет статус/комментарий/Updated At в Sheets.
-    Если new_status is None — меняем только комментарий и Updated At.
+    """Обновляет статус/комментарий/Updated At в Sheets.
+       Если new_status is None — меняем только комментарий и Updated At.
     """
     try:
         ws = _get_sheet()
@@ -114,15 +128,21 @@ def update_sheet_status_and_comment(appwrite_id: str, new_status: Optional[str],
         row = matches[0].row
         idx = _header_indexes(ws)
 
-        status_col = idx.get("статус")
-        comment_col = idx.get("комментарий")
+        status_col     = idx.get("статус")
+        comment_col    = idx.get("комментарий")
         updated_at_col = idx.get("updated at")
 
         batch = []
         if new_status is not None and status_col:
-            batch.append({"range": gspread.utils.rowcol_to_a1(row, status_col), "values": [[new_status]]})
+            batch.append({
+                "range": gspread.utils.rowcol_to_a1(row, status_col),
+                "values": [[new_status]],
+            })
         if comment is not None and comment_col:
-            batch.append({"range": gspread.utils.rowcol_to_a1(row, comment_col), "values": [[comment]]})
+            batch.append({
+                "range": gspread.utils.rowcol_to_a1(row, comment_col),
+                "values": [[comment]],
+            })
         if updated_at_col:
             from datetime import datetime, timezone
             batch.append({
@@ -135,39 +155,42 @@ def update_sheet_status_and_comment(appwrite_id: str, new_status: Optional[str],
     except Exception as e:
         logging.exception("Не удалось обновить Google Sheets: %s", e)
 
-
-# -----------------------------------------------------------------------------
-# Клавиатуры для карточки
-# -----------------------------------------------------------------------------
-def admin_actions_kb(doc_id: str, back_status: str):
-    """
-    Кнопки под заявкой:
-      Принять / Отклонить / Комментарий / Назад
-    """
+# ----------------------------------------------------------------------------- #
+# Клавиатуры карточки
+# ----------------------------------------------------------------------------- #
+def admin_actions_kb(doc_id: str, back_status: str, allow_reply: bool):
+    """Кнопки под заявкой: Принять / Отклонить / Комментарий / Запрос ответа / Вопрос / Назад"""
     from aiogram.utils.keyboard import InlineKeyboardBuilder
-
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Принять", callback_data=f"admin:decide:{doc_id}:approved:{back_status}:1")
     kb.button(text="❌ Отклонить", callback_data=f"admin:decide:{doc_id}:rejected:{back_status}:1")
     kb.button(text="💬 Комментарий", callback_data=f"admin:note:{doc_id}:{back_status}")
     kb.adjust(2, 1)
+
+    # toggle allow
+    if allow_reply:
+        kb.button(text="🗨️ Запретить ответ", callback_data=f"admin:toggle_reply:{doc_id}:{back_status}:off")
+    else:
+        kb.button(text="🗨️ Разрешить ответ", callback_data=f"admin:toggle_reply:{doc_id}:{back_status}:on")
+    kb.button(text="✏️ Задать вопрос", callback_data=f"admin:ask:{doc_id}:{back_status}")
+    kb.adjust(2)
+
     kb.button(text="⬅️ Назад к списку", callback_data=f"admin:back:{back_status}")
     kb.adjust(1)
     return kb.as_markup()
 
-
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # UI: меню/списки
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 async def _send_status_menu(msg_or_cb):
     from aiogram.utils.keyboard import InlineKeyboardBuilder
-    c_pending = _safe_count("pending")
+    c_pending  = _safe_count("pending")
     c_approved = _safe_count("approved")
     c_rejected = _safe_count("rejected")
 
     kb = InlineKeyboardBuilder()
-    kb.button(text=f"⏳ В ожидании ({c_pending})", callback_data="admin:show:pending")
-    kb.button(text=f"✅ Принятые ({c_approved})", callback_data="admin:show:approved")
+    kb.button(text=f"⏳ В ожидании ({c_pending})",  callback_data="admin:show:pending")
+    kb.button(text=f"✅ Принятые ({c_approved})",  callback_data="admin:show:approved")
     kb.button(text=f"❌ Отклонённые ({c_rejected})", callback_data="admin:show:rejected")
     kb.adjust(1)
 
@@ -177,7 +200,6 @@ async def _send_status_menu(msg_or_cb):
     else:
         await msg_or_cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb.as_markup())
 
-
 async def _send_list_by_status(msg_or_cb, status: str, group: Optional[str] = None):
     repo = get_repo()
     res = repo.list_submissions(status=status, page=1, page_size=30, group=group)
@@ -185,7 +207,6 @@ async def _send_list_by_status(msg_or_cb, status: str, group: Optional[str] = No
 
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     kb = InlineKeyboardBuilder()
-
     for doc in items:
         title = f"{doc.get('full_name','?')} | {doc.get('group','?')}"
         kb.button(text=title[:60], callback_data=f"admin:view:{doc['$id']}:{status}")
@@ -201,10 +222,9 @@ async def _send_list_by_status(msg_or_cb, status: str, group: Optional[str] = No
     else:
         await msg_or_cb.message.edit_text(header, parse_mode="HTML", reply_markup=kb.as_markup())
 
-
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 # Handlers
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- #
 @router.message(Command("admin"))
 async def admin_entry(msg: Message):
     repo = get_repo()
@@ -213,19 +233,16 @@ async def admin_entry(msg: Message):
         return
     await _send_status_menu(msg)
 
-
 @router.callback_query(F.data.startswith("admin:show:"))
 async def admin_show(cb: CallbackQuery):
     _, _, status = cb.data.split(":")
     await _send_list_by_status(cb, status=status)
     await cb.answer()
 
-
 @router.callback_query(F.data == "admin:menu")
 async def admin_back(cb: CallbackQuery):
     await _send_status_menu(cb)
     await cb.answer()
-
 
 @router.callback_query(F.data.startswith("admin:search:"))
 async def admin_search(cb: CallbackQuery, state: FSMContext):
@@ -235,7 +252,6 @@ async def admin_search(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.waiting_group)
     await cb.answer()
 
-
 @router.message(AdminState.waiting_group)
 async def admin_search_group(msg: Message, state: FSMContext):
     data = await state.get_data()
@@ -243,7 +259,6 @@ async def admin_search_group(msg: Message, state: FSMContext):
     group = msg.text.strip()
     await state.clear()
     await _send_list_by_status(msg, status=status, group=group)
-
 
 @router.callback_query(F.data.startswith("admin:view:"))
 async def admin_view(cb: CallbackQuery):
@@ -255,6 +270,7 @@ async def admin_view(cb: CallbackQuery):
         await cb.answer("Не удалось загрузить документ", show_alert=True)
         return
 
+    allow = bool(doc.get("allow_student_reply", False))
     text = (
         f"<b>Заявка</b>\n\n"
         f"👤 ФИО: {doc.get('full_name','—')}\n"
@@ -273,12 +289,15 @@ async def admin_view(cb: CallbackQuery):
         f"⚙️ Планируемый функционал: {doc.get('plannedFeatures','—')}\n"
         f"🖥️ Стек технологий: {doc.get('techStack','—')}\n\n"
         f"📌 Статус: {doc.get('status','—')}\n"
-        f"💬 Комментарий: {doc.get('admin_comment','—')}"
+        f"💬 Комментарий: {doc.get('admin_comment','—')}\n\n"
+        f"🗨️ Ответ студента разрешён: {'да' if allow else 'нет'}\n"
+        f"❓ Вопрос студенту: {doc.get('admin_question','—')}\n"
+        f"📝 Ответ студента: {doc.get('student_answer','—')}"
     )
 
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=admin_actions_kb(doc_id, status))
+    await cb.message.edit_text(text, parse_mode="HTML",
+                               reply_markup=admin_actions_kb(doc_id, status, allow))
     await cb.answer()
-
 
 # --- Решение (approve/reject) ---
 @router.callback_query(F.data.startswith("admin:decide:"))
@@ -288,7 +307,6 @@ async def admin_decide(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Напишите комментарий к решению (или '-' если без комментария).")
     await state.set_state(AdminState.waiting_comment)
     await cb.answer()
-
 
 @router.message(AdminState.waiting_comment)
 async def admin_comment(msg: Message, state: FSMContext, bot: Bot):
@@ -308,7 +326,6 @@ async def admin_comment(msg: Message, state: FSMContext, bot: Bot):
     repo.update_submission_status(doc_id, decision, comment)
     update_sheet_status_and_comment(doc_id, decision, comment or None)
 
-    # уведомление студенту
     student_tg = doc.get("tg_user_id")
     if student_tg:
         try:
@@ -325,8 +342,7 @@ async def admin_comment(msg: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await _send_status_menu(msg)
 
-
-# --- Просто комментарий (без смены статуса) ---
+# --- Просто комментарий ---
 @router.callback_query(F.data.startswith("admin:note:"))
 async def admin_note_ask(cb: CallbackQuery, state: FSMContext):
     _, _, doc_id, back_status = cb.data.split(":")
@@ -334,7 +350,6 @@ async def admin_note_ask(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Напишите комментарий (без изменения статуса).")
     await state.set_state(AdminState.waiting_note)
     await cb.answer()
-
 
 @router.message(AdminState.waiting_note)
 async def admin_note_save(msg: Message, state: FSMContext, bot: Bot):
@@ -344,7 +359,6 @@ async def admin_note_save(msg: Message, state: FSMContext, bot: Bot):
     note = msg.text.strip()
 
     try:
-        # обновляем только комментарий
         repo.db.update_document(
             database_id=repo.db_id,
             collection_id=repo.sub_col,
@@ -353,7 +367,7 @@ async def admin_note_save(msg: Message, state: FSMContext, bot: Bot):
         )
         update_sheet_status_and_comment(doc_id, None, note or None)
 
-        # уведомим студента, что пришёл комментарий
+        # уведомим студента
         try:
             doc = repo.db.get_document(repo.db_id, repo.sub_col, doc_id)
             student_tg = doc.get("tg_user_id")
@@ -369,6 +383,141 @@ async def admin_note_save(msg: Message, state: FSMContext, bot: Bot):
         await msg.answer("Комментарий сохранён ✅")
     except Exception:
         await msg.answer("Не удалось сохранить комментарий 😕")
+    finally:
+        await state.clear()
+        await _send_status_menu(msg)
+
+# --- Toggle allow student reply ---
+@router.callback_query(F.data.startswith("admin:toggle_reply:"))
+async def admin_toggle_reply(cb: CallbackQuery):
+    _, _, doc_id, back_status, mode = cb.data.split(":")
+    repo = get_repo()
+    allow = True if mode == "on" else False
+
+    # 1) Обновляем флаг в БД
+    try:
+        repo.db.update_document(
+            database_id=repo.db_id,
+            collection_id=repo.sub_col,
+            document_id=doc_id,
+            data={"allow_student_reply": allow},
+        )
+    except Exception:
+        await cb.answer("Ошибка при обновлении", show_alert=True)
+        return
+
+    # 2) Оповещаем студента
+    try:
+        doc = repo.db.get_document(repo.db_id, repo.sub_col, doc_id)
+        student_tg = doc.get("tg_user_id")
+        if student_tg:
+            if allow:
+                # если используете модель с «принять/отклонить» от студента:
+                from aiogram.utils.keyboard import InlineKeyboardBuilder
+                kb = InlineKeyboardBuilder()
+                kb.button(text="✅ Подтвердить заявку", callback_data="student:answer:yes")
+                kb.button(text="❌ Отменить заявку", callback_data="student:answer:no")
+                kb.button(text="📄 Моя заявка", callback_data="student:menu:view")
+                kb.adjust(2, 1)
+
+                await cb.bot.send_message(
+                    int(student_tg),
+                    "🗨️ Вам разрешили ответ по вашей заявке. Выберите вариант:",
+                    reply_markup=kb.as_markup(),
+                )
+            else:
+                await cb.bot.send_message(
+                    int(student_tg),
+                    "⛔️ Возможность ответа по вашей заявке отключена.",
+                )
+    except Exception:
+        # не ломаемся, если уведомление не ушло
+        pass
+
+    # 3) Перерисовываем карточку сразу у админа (REAL-TIME)
+    try:
+        # свежие данные
+        doc = repo.db.get_document(repo.db_id, repo.sub_col, doc_id)
+        allow_now = bool(doc.get("allow_student_reply", False))
+        has_question = bool(doc.get("admin_question"))
+        allow_answer = bool(doc.get("allow_student_reply", False))
+
+        text = (
+            f"<b>Заявка</b>\n\n"
+            f"👤 ФИО: {doc.get('full_name','—')}\n"
+            f"👥 Группа: {doc.get('group','—')}\n"
+            f"📧 Email: {doc.get('email','—')}\n"
+            f"📅 Дата рождения: {doc.get('birthDate','—')}\n\n"
+            f"📚 Любимые книги: {doc.get('books','—')}\n"
+            f"🎬 Любимый фильм/сериал: {doc.get('likedRecentMovie','—')}\n"
+            f"ℹ️ Коротко о вас: {doc.get('aboutYou','—')}\n"
+            f"🎓 Планы после университета: {doc.get('afterUniversity','—')}\n"
+            f"🎖 Красный диплом: {doc.get('redDiploma','—')}\n"
+            f"📑 Интерес к научной деятельности: {doc.get('scienceInterest','—')}\n\n"
+            f"📝 Тема работы: {doc.get('thesisTopic','—')}\n"
+            f"📄 Описание работы: {doc.get('thesisDescription','—')}\n"
+            f"📊 Аналоги проекта: {doc.get('analogsProsCons','—')}\n"
+            f"⚙️ Планируемый функционал: {doc.get('plannedFeatures','—')}\n"
+            f"🖥️ Стек технологий: {doc.get('techStack','—')}\n\n"
+            f"📌 Статус: {doc.get('status','—')}\n"
+            f"💬 Комментарий: {doc.get('admin_comment','—')}\n\n"
+            f"🗨️ Ответ студента разрешён: {'да' if allow_now else 'нет'}\n"
+            f"❓ Вопрос студенту: {doc.get('admin_question','—')}\n"
+            f"📝 Ответ студента: {doc.get('student_answer','—')}"
+        )
+
+        await cb.message.edit_text(
+            text, parse_mode="HTML",
+            reply_markup=admin_actions_kb(doc_id, back_status, allow_now)
+        )
+    except Exception:
+        # в крайнем случае просто молча игнорим (например, "message is not modified")
+        pass
+
+    await cb.answer("Обновлено")
+
+
+# --- Ask question to student ---
+@router.callback_query(F.data.startswith("admin:ask:"))
+async def admin_ask_question(cb: CallbackQuery, state: FSMContext):
+    _, _, doc_id, back_status = cb.data.split(":")
+    await state.update_data(doc_id=doc_id, back_status=back_status)
+    await cb.message.answer("Введите вопрос студенту:")
+    await state.set_state(AdminState.waiting_question)
+    await cb.answer()
+
+@router.message(AdminState.waiting_question)
+async def admin_save_question(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    repo = get_repo()
+    doc_id = data["doc_id"]
+    q = msg.text.strip()
+
+    try:
+        repo.db.update_document(
+            database_id=repo.db_id,
+            collection_id=repo.sub_col,
+            document_id=doc_id,
+            data={"admin_question": q},
+        )
+
+        # уведомляем студента
+        try:
+            doc = repo.db.get_document(repo.db_id, repo.sub_col, doc_id)
+            student_tg = doc.get("tg_user_id")
+            if student_tg:
+                await bot.send_message(
+                    int(student_tg),
+                    "❓ Вам задан вопрос по вашей заявке.",
+                    # Кнопка только «Открыть мою заявку», без «Принять/Отклонить»
+                    reply_markup=_student_open_kb(allow_answer=False),
+                )
+        except Exception:
+            pass
+
+        await msg.answer("Вопрос сохранён ✅")
+    except Exception:
+        await msg.answer("Не удалось сохранить вопрос.")
     finally:
         await state.clear()
         await _send_status_menu(msg)
